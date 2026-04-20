@@ -20,16 +20,17 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+
 app = FastAPI()
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# ---------------- QUEUE SYSTEM ----------------
+# ---------------- STORAGE ----------------
 queue = asyncio.Queue()
 user_data = {}
 
-# ---------------- PROGRESS TRACKER ----------------
-progress_messages = {}
-
+# ---------------- PLATFORM DETECTOR ----------------
 def detect_platform(url: str):
     if "tiktok" in url:
         return "TikTok"
@@ -41,25 +42,18 @@ def detect_platform(url: str):
 
 
 # ---------------- DOWNLOAD ENGINE ----------------
-def download_video(url, quality, progress_cb=None):
-
+def download_video(url, quality):
     format_map = {
         "720": "best[height<=720]",
         "360": "best[height<=360]",
         "best": "best",
     }
 
-    def hook(d):
-        if d.get("status") == "downloading":
-            if progress_cb:
-                progress_cb(d.get("_percent_str", "0%"))
-
     ydl_opts = {
         "format": format_map.get(quality, "best"),
         "outtmpl": "downloads/%(title).50s.%(ext)s",
         "noplaylist": True,
         "quiet": True,
-        "progress_hooks": [hook],
     }
 
     os.makedirs("downloads", exist_ok=True)
@@ -74,33 +68,28 @@ def download_video(url, quality, progress_cb=None):
 # ---------------- WORKER ----------------
 async def worker():
     while True:
-        update, quality = await queue.get()
+        user_id, chat_id, quality = await queue.get()
 
-        user_id = update.message.from_user.id
         url = user_data.get(user_id)
 
         if not url:
             queue.task_done()
             continue
 
-        msg = await update.message.reply_text("⏳ Starting download...")
-
-        def progress(p):
-            try:
-                asyncio.create_task(
-                    msg.edit_text(f"📥 Downloading... {p}")
-                )
-            except:
-                pass
+        msg = await application.bot.send_message(
+            chat_id=chat_id,
+            text="⏳ Starting download..."
+        )
 
         try:
             file_path = await asyncio.to_thread(
-                download_video, url, quality, progress
+                download_video, url, quality
             )
 
             await msg.edit_text("📤 Uploading...")
 
-            await update.message.reply_video(
+            await application.bot.send_video(
+                chat_id=chat_id,
                 video=open(file_path, "rb"),
                 caption=f"✅ Done ({detect_platform(url)}) - {quality}"
             )
@@ -114,10 +103,10 @@ async def worker():
         queue.task_done()
 
 
-# ---------------- BOT HANDLERS ----------------
+# ---------------- HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 V5 PRO MAX DOWNLOADER\nSend me a video link"
+        "🚀 V5 PRO DOWNLOADER\nSend me a video link"
     )
 
 
@@ -149,11 +138,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await queue.put((query, query.data))
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    quality = query.data
+
+    await queue.put((user_id, chat_id, quality))
+
     await query.edit_message_text("🟡 Added to queue...")
 
 
-# ---------------- REGISTER ----------------
+# ---------------- REGISTER HANDLERS ----------------
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_handler(CallbackQueryHandler(button))
@@ -162,7 +156,7 @@ application.add_handler(CallbackQueryHandler(button))
 # ---------------- FASTAPI ----------------
 @app.get("/")
 def home():
-    return {"status": "V5 PRO MAX RUNNING 🚀"}
+    return {"status": "V5 PRO RUNNING 🚀"}
 
 
 @app.post("/webhook")
@@ -179,7 +173,6 @@ async def startup():
     await application.initialize()
     await application.start()
 
-    # start worker
     asyncio.create_task(worker())
 
     if WEBHOOK_URL:
